@@ -1,6 +1,7 @@
 package rethinkdb_session_store
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/dancannon/gorethink"
@@ -63,40 +64,63 @@ func (s *RethinkDBStore) Save(r *http.Request, w http.ResponseWriter, session *s
 }
 
 func (s *RethinkDBStore) save(session *sessions.Session) error {
-	encoded, err := securecookie.EncodeMulti(session.Name(), session.Values, s.Codecs...)
-	if err != nil {
-		return err
+	values := map[string]interface{}{}
+	for k, v := range session.Values {
+		kstr, ok := k.(string)
+		if !ok {
+			return errors.New("cannot serialize non-string value key")
+		}
+
+		values[kstr] = v
 	}
 
-	value := map[string]interface{}{"encoded": encoded}
-	if session.ID != "" {
-		_, err := s.term.Get(session.ID).Update(value).Run(s.rethinkdbSession)
-		if err != nil {
-			return err
-		}
-	} else {
-		write, err := s.term.Insert(value).RunWrite(s.rethinkdbSession)
-		if err != nil {
-			return err
-		}
-		session.ID = write.GeneratedKeys[0]
+	json := map[string]interface{}{
+		"name":   session.Name(),
+		"values": values,
 	}
-	return nil
+
+	var write gorethink.WriteResponse
+	var err error
+	if session.ID != "" {
+		write, err = s.term.Get(session.ID).Update(json).RunWrite(s.rethinkdbSession)
+		if err == nil && write.Updated == 0 {
+			json["id"] = session.ID
+		}
+	}
+
+	if write.Updated == 0 {
+		write, err = s.term.Insert(json).RunWrite(s.rethinkdbSession)
+		if err == nil && len(write.GeneratedKeys) > 0 {
+			session.ID = write.GeneratedKeys[0]
+		}
+	}
+
+	return err
 }
 
 func (s *RethinkDBStore) load(session *sessions.Session) error {
-	value := map[string]interface{}{}
+	if session.ID == "" {
+		return errors.New("invalid session id")
+	}
+
+	json := map[string]interface{}{}
 	cursor, err := s.term.Get(session.ID).Run(s.rethinkdbSession)
 	if err != nil {
 		return err
 	}
-	err = cursor.One(&value)
+	err = cursor.One(&json)
 	if err != nil {
 		return err
 	}
 
-	if err = securecookie.DecodeMulti(session.Name(), value["encoded"].(string), &session.Values, s.Codecs...); err != nil {
-		return err
+	values, ok := json["values"].(map[string]interface{})
+	if !ok {
+		return errors.New("failed to decode session")
 	}
+
+	for k, v := range values {
+		session.Values[k] = v
+	}
+
 	return nil
 }
